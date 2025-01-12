@@ -1,8 +1,8 @@
 extern crate rand;
 
 use std::sync::mpmc::{Receiver, Sender};
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::{cmp, thread};
 
 use log::{error, info};
 use rand::Rng;
@@ -10,6 +10,27 @@ use rand::Rng;
 const SCREEN_WIDTH: usize = 64;
 const SCREEN_HEIGHT: usize = 32;
 const SCREEN_SIZE: usize = SCREEN_WIDTH * SCREEN_HEIGHT;
+
+const FONT_ADDRESS: usize = 0x050;
+
+const FONT: [u8; 80] = [
+    0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
+    0x20, 0x60, 0x20, 0x20, 0x70, // 1
+    0xF0, 0x10, 0xF0, 0x80, 0xF0, // 2
+    0xF0, 0x10, 0xF0, 0x10, 0xF0, // 3
+    0x90, 0x90, 0xF0, 0x10, 0x10, // 4
+    0xF0, 0x80, 0xF0, 0x10, 0xF0, // 5
+    0xF0, 0x80, 0xF0, 0x90, 0xF0, // 6
+    0xF0, 0x10, 0x20, 0x40, 0x40, // 7
+    0xF0, 0x90, 0xF0, 0x90, 0xF0, // 8
+    0xF0, 0x90, 0xF0, 0x10, 0xF0, // 9
+    0xF0, 0x90, 0xF0, 0x90, 0x90, // A
+    0xE0, 0x90, 0xE0, 0x90, 0xE0, // B
+    0xF0, 0x80, 0x80, 0x80, 0xF0, // C
+    0xE0, 0x90, 0x90, 0x90, 0xE0, // D
+    0xF0, 0x80, 0xF0, 0x80, 0xF0, // E
+    0xF0, 0x80, 0xF0, 0x80, 0x80, // F
+];
 
 #[derive(PartialEq, Eq)]
 enum SystemState {
@@ -31,6 +52,7 @@ pub struct System {
     keys: [bool; 16],
     gfx: [bool; SCREEN_SIZE],
     redraw_required: bool,
+    last_timer_update: Instant,
 }
 
 impl System {
@@ -48,6 +70,7 @@ impl System {
             keys: [false; 16],
             gfx: [false; SCREEN_SIZE],
             redraw_required: true,
+            last_timer_update: Instant::now(),
         };
     }
 
@@ -64,16 +87,23 @@ impl System {
         self.keys = [false; 16];
         self.gfx = [false; SCREEN_SIZE];
         self.redraw_required = true;
+        self.last_timer_update = Instant::now();
     }
 
-    pub fn run<'a>(&'a mut self, tx_draw: &Sender<[bool; SCREEN_SIZE]>, rx_quit: &Receiver<bool>) {
+    pub fn run<'a>(
+        &'a mut self,
+        tx_draw: &Sender<[bool; SCREEN_SIZE]>,
+        rx_quit: &Receiver<bool>,
+    ) -> Result<(), String> {
         self.state = SystemState::Running;
+        self.load_font();
 
         // TODO: remove debug pixels
         self.gfx[0] = true;
         self.gfx[SCREEN_WIDTH - 1] = true;
         self.gfx[SCREEN_WIDTH * SCREEN_HEIGHT - SCREEN_WIDTH] = true;
         self.gfx[SCREEN_SIZE - 1] = true;
+        tx_draw.send(self.gfx.clone()).map_err(|e| e.to_string())?;
 
         while self.state == SystemState::Running {
             if let Ok(_) = rx_quit.try_recv() {
@@ -84,9 +114,17 @@ impl System {
 
             // send redraw message
             if self.redraw_required {
-                tx_draw.send(self.gfx.clone()).unwrap();
+                tx_draw.send(self.gfx.clone()).map_err(|e| e.to_string())?;
                 self.redraw_required = false;
             }
+        }
+
+        Ok(())
+    }
+
+    fn load_font<'a>(&'a mut self) {
+        for i in 0..FONT.len() {
+            self.memory[FONT_ADDRESS] = FONT[i];
         }
     }
 
@@ -126,9 +164,23 @@ impl System {
         if !opcode_valid {
             let address = self.pc;
             error!("Invalid opcode {opcode:#06x} at address {address:#06x}");
+            self.state = SystemState::Quit;
         }
 
-        thread::sleep(Duration::from_millis(500));
+        // update timers
+        let elapsed = self.last_timer_update.elapsed();
+        if elapsed > Duration::from_millis(1000 / 60) {
+            let ticks = (elapsed.as_millis() as f64 / (1000f64 / 60f64)) as u8;
+            if self.delay_timer > 0 {
+                self.delay_timer -= cmp::min(ticks, self.delay_timer);
+            }
+            if self.sound_timer > 0 {
+                self.sound_timer -= cmp::min(ticks, self.sound_timer);
+            }
+            self.last_timer_update = Instant::now();
+        }
+
+        thread::sleep(Duration::from_millis(33));
     }
 
     fn op_0xxx<'a>(&'a mut self, opcode: u16) -> bool {
@@ -142,7 +194,13 @@ impl System {
                 self.next_instruction();
                 true
             }
-            0x00EE => false,
+            0x00EE => {
+                // 00EE: return from a subroutine. set pc to the address at
+                // the top of the stack and subtract 1 from the sp
+                self.sp -= 1;
+                self.pc = self.stack[self.sp as usize];
+                true
+            }
             _ => false,
         };
     }
@@ -326,8 +384,8 @@ impl System {
     }
     fn op_dxxx<'a>(&'a mut self, opcode: u16) -> bool {
         // DXYN: draw sprite at coordinate (v[x], v[y]) that is 8xN pixels in size
-        let start_x = ((opcode & 0x0F00) >> 8) as u8;
-        let start_y = ((opcode & 0x00F0) >> 4) as u8;
+        let start_x = self.v[((opcode & 0x0F00) >> 8) as usize];
+        let start_y = self.v[((opcode & 0x00F0) >> 4) as usize];
         let height = (opcode & 0x000F) as u8;
 
         self.v[0xF] = 0;
@@ -384,18 +442,19 @@ impl System {
 
         return match opcode & 0x00FF {
             0x0007 => {
-                // FX0A: set v[x] to the value of the delay timer
+                // FX07: set v[x] to the value of the delay timer
                 self.v[x] = self.delay_timer;
                 self.next_instruction();
                 true
             }
             0x000A => {
-                // TODO: FX15: wait for key press and store it in v[x].
+                // FX0A: wait for key press and store it in v[x].
                 // this is a blocking operation. halt all instructions
                 // until next key event. timers should continue processing
                 false
             }
             0x0015 => {
+                // FX15: set the delay timer to the value of v[x]
                 self.delay_timer = self.v[x];
                 self.next_instruction();
                 true
@@ -416,7 +475,9 @@ impl System {
                 // FX29: set i to the location of the sprite for the character
                 // v[x] (only consider lowest nibble).
                 // characters 0x0-0xF are represented by a 4x5 font
-                false
+                self.i = FONT_ADDRESS as u16 + (self.v[x] * 5) as u16;
+                self.next_instruction();
+                true
             }
             0x0033 => {
                 // FX33: store the binary-coded decimal representation of v[x]

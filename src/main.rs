@@ -79,7 +79,7 @@ fn init_ui(rx_quit: &Receiver<bool>, rx_draw: &Receiver<[bool; 64 * 32]>) -> Res
     let video_subsystem = sdl_context.video()?;
 
     let window = video_subsystem
-        .window("CHIP-8 emulator", 640, 320)
+        .window("Nic's CHIP-8 Emulator", 640, 320)
         .position_centered()
         .build()
         .map_err(|e| e.to_string())?;
@@ -103,7 +103,19 @@ fn init_ui(rx_quit: &Receiver<bool>, rx_draw: &Receiver<[bool; 64 * 32]>) -> Res
 
     canvas.present();
 
+    thread::sleep(Duration::from_secs(1));
+
     'mainloop: loop {
+        // handle events coming in through the message channel
+        if let Ok(gfx) = rx_draw.try_recv() {
+            // update texture
+            texture.with_lock(None, |buffer: &mut [u8], pitch: usize| {
+                bool_to_rgb24_inplace(&gfx, buffer);
+            })?;
+            canvas.copy(&texture, None, None)?;
+            canvas.present();
+        }
+
         // handle quit events
         if let Ok(_) = rx_quit.recv_timeout(Duration::from_millis(50)) {
             break 'mainloop;
@@ -121,16 +133,6 @@ fn init_ui(rx_quit: &Receiver<bool>, rx_draw: &Receiver<[bool; 64 * 32]>) -> Res
                 }
                 _ => {}
             }
-        }
-
-        // handle events coming in through the message channel
-        if let Ok(gfx) = rx_draw.try_recv() {
-            // update texture
-            texture.with_lock(None, |buffer: &mut [u8], pitch: usize| {
-                bool_to_rgb24_inplace(&gfx, buffer);
-            })?;
-            canvas.copy(&texture, None, None)?;
-            canvas.present();
         }
     }
 
